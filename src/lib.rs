@@ -362,6 +362,21 @@ impl<T> Origin<T> {
         Self::from_iter(iter.into_iter().map(Update::insert))
     }
 
+    /// Creates an origin from an iterator of batches of items to introduce.
+    pub fn from_batches(iter: impl IntoIterator<Item: IntoIterator<Item = T>>) -> Self {
+        let (tx, rx) = flume::unbounded();
+
+        for batch in iter.into_iter() {
+            for item in batch {
+                tx.send(Input::Update(Update::insert(item))).unwrap();
+            }
+
+            tx.send(Input::Flush).unwrap();
+        }
+
+        Self { rx }
+    }
+
     /// Receives an input update while cooperatively executing Rayon tasks.
     fn recv_and_yield(&self) -> Input<T> {
         loop {
