@@ -1,66 +1,337 @@
 use flume::Receiver;
-use im::{OrdMap, OrdSet};
+use im::OrdMap;
 use parking_lot::Mutex;
 use rayon::{prelude::*, yield_now};
 
 #[cfg(test)]
 pub mod tests;
 
-/// A single differential (insert/remove) update for an item.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Update<T> {
-    /// The item.
-    pub item: T,
-
-    /// `true` for insertion, `false` for removal.
-    pub weight: bool,
+/// Efficiently produces the union of two values (typically dataflows)
+/// while producing side effects on state `S`.
+///
+/// This makes it possible to run multiple dataflows of the same type
+/// to fixedpoint on disjoint inputs then efficiently unify them.
+pub trait Union<S> {
+    /// Unions this value with another.
+    ///
+    /// Returns `true` if there were any side effects.
+    fn union(&mut self, state: &mut S, other: &Self) -> bool;
 }
 
-impl<T> Update<T> {
-    pub fn map<O>(self, cb: impl FnOnce(T) -> O) -> Update<O> {
-        Update {
-            item: cb(self.item),
-            weight: self.weight,
+/// Convenience methods for nodes.
+pub trait NodeExt: Node {
+    /// Maps the items in this node, potentially from one type to another.
+    fn map<O: Send + Sync>(
+        self,
+        cb: impl Fn(Self::Item) -> O + Send + Sync,
+    ) -> impl Node<Item = O> {
+        Map { node: self, cb }
+    }
+
+    /// Consolidates a single update batch into a running total of weight deltas.
+    fn consolidate(&mut self) -> OrdMap<Self::Item, i16>
+    where
+        Self::Item: Clone + Ord + Send + Sync,
+    {
+        // TODO: use explicit im pool allocation?
+        // TODO: make diff type generic (needs "one" value from num crate)
+        let mut total = OrdMap::new();
+
+        self.reduce(
+            OrdMap::new,
+            |subtotal, update| {
+                let delta = update.delta();
+                let entry = subtotal.entry(update.item).or_default();
+                *entry += delta;
+            },
+            |subtotal| {
+                total = total
+                    .clone()
+                    .union_with(subtotal, |total, subtotal| total + subtotal);
+            },
+        );
+
+        total
+    }
+}
+
+impl<N: Node> NodeExt for N {}
+
+/// A symmetric equijoin dataflow node.
+pub struct Join<L: KeyValueNode, R: KeyValueNode> {
+    left: Arrange<L>,
+    right: Arrange<R>,
+}
+
+impl<L, R> Node for Join<L, R>
+where
+    L: KeyValueNode,
+    R: KeyValueNode<Key = L::Key>,
+{
+    type Item = (L::Key, L::Value, R::Value);
+
+    fn reduce<T>(
+        &mut self,
+        begin: impl Fn() -> T + Send + Sync,
+        for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
+        finish: impl FnMut(T) + Send + Sync,
+    ) {
+        self.left.join(&mut self.right, begin, for_each, finish);
+    }
+}
+
+pub struct Arrange<N: KeyValueNode> {
+    node: N,
+    weights: OrdMap<N::Key, OrdMap<N::Value, i16>>,
+}
+
+impl<N> Arrange<N>
+where
+    N: KeyValueNode,
+{
+    pub fn join<T, R: KeyValueNode<Key = N::Key>>(
+        &mut self,
+        right: &mut Arrange<R>,
+        begin: impl Fn() -> T + Send + Sync,
+        for_each: impl Fn(&mut T, Update<(N::Key, N::Value, R::Value)>) + Send + Sync,
+        mut finish: impl FnMut(T) + Send + Sync,
+    ) {
+        // copy current weights to observe updates in parallel
+        let weights = self.weights.clone();
+
+        // reduce right branch
+        right.reduce_by_key(
+            |key| {
+                (
+                    key.clone(),
+                    weights.get(key).cloned().unwrap_or_default(),
+                    begin(),
+                )
+            },
+            |(key, left, state), update| {
+                // TODO: figure out the weight diff logic (write unit tests)
+                for (left, weight) in left.iter() {
+                    let key = key.clone();
+                    let left = left.clone();
+                    let weight = *weight > 0;
+                    let update = update.clone().map(|right| (key, left, right));
+                    for_each(state, update);
+                }
+            },
+            |(key, left, state), weights| {
+                finish(state);
+            },
+        );
+
+        // copy right weights to observe updates in parallel
+        let weights = right.weights.clone();
+
+        // reduce left branch
+        self.reduce_by_key(
+            |key| {
+                (
+                    key.clone(),
+                    weights.get(key).cloned().unwrap_or_default(),
+                    begin(),
+                )
+            },
+            |(key, right, state), update| {
+                // TODO: figure out the weight diff logic (write unit tests)
+                for (right, weight) in right.iter() {
+                    let key = key.clone();
+                    let right = right.clone();
+                    let weight = *weight > 0;
+                    let update = update.clone().map(|left| (key, left, right));
+                    for_each(state, update);
+                }
+            },
+            |(key, left, state), weights| {
+                finish(state);
+            },
+        );
+    }
+
+    pub fn reduce_by_key<T>(
+        &mut self,
+        begin: impl Fn(&N::Key) -> T + Send + Sync,
+        for_each: impl Fn(&mut T, Update<N::Value>) + Send + Sync,
+        finish: impl FnMut(T, &OrdMap<N::Value, i16>) + Send + Sync,
+    ) {
+        // retrieve all node deltas batched by key
+        let delta = self.node.consolidate_by_key();
+
+        // copy current weights to observe in parallel
+        let weights = self.weights.clone();
+
+        // wrap mutable data in mutexes
+        let finish = Mutex::new(finish);
+        let weights_out = Mutex::new(&mut self.weights);
+
+        // iterate in parallel on each key at a time
+        delta.into_iter().par_bridge().for_each(|(key, values)| {
+            // lazily initialize iterator state
+            let mut state = None;
+
+            // retrieve the current weights
+            let mut weights = weights.get(&key).cloned().unwrap_or_default();
+
+            // retain if the current weights were empty to save diffing later
+            let was_empty = weights.is_empty();
+
+            // track if the weights were changed at all
+            let mut weights_dirty = false;
+
+            // run delta of each value against current state
+            // TODO: use OrdMap::diff() instead to minimize lookups
+            for (value, delta) in values {
+                // if delta is 0, skip weight update
+                if delta == 0 {
+                    continue;
+                }
+
+                // update running weight based on delta
+                weights = weights.alter(
+                    |entry| {
+                        // compute weights of this entry
+                        let old_weight = entry.unwrap_or(0);
+                        let new_weight = old_weight + delta;
+
+                        // if weight crosses existence threshold, send update
+                        if new_weight > 0 && old_weight <= 0 {
+                            let state = state.get_or_insert_with(|| begin(&key));
+                            let update = Update::insert(value.clone());
+                            for_each(state, update);
+                        } else if new_weight <= 0 && old_weight > 0 {
+                            let state = state.get_or_insert_with(|| begin(&key));
+                            let update = Update::remove(value.clone());
+                            for_each(state, update);
+                        }
+
+                        // ensure weight dirtiness is tracked
+                        weights_dirty = true;
+
+                        // return new weight, or none if zero
+                        if new_weight == 0 {
+                            None
+                        } else {
+                            Some(new_weight)
+                        }
+                    },
+                    value.clone(),
+                );
+            }
+
+            // if state was used, finish
+            if let Some(state) = state {
+                let mut finish = finish.lock();
+                finish(state, &weights);
+            }
+
+            // modify weights based on occupancy change
+            if weights_dirty {
+                if !was_empty && weights.is_empty() {
+                    // remove weights if they became empty
+                    weights_out.lock().remove(&key);
+                } else {
+                    // directly update weights otherwise
+                    weights_out.lock().insert(key, weights);
+                }
+            }
+        });
+    }
+}
+
+/// A trait for nodes that collect key-value collections.
+pub trait KeyValueNode: Node<Item = (Self::Key, Self::Value)> {
+    /// The key stored in each node value.
+    type Key: Clone + Ord + Send + Sync + 'static;
+
+    /// The value stored in each node value.
+    type Value: Clone + Ord + Send + Sync;
+
+    /// Joins this node against another key-value node.
+    fn join<O>(self, other: O) -> impl Node<Item = (Self::Key, Self::Value, O::Value)>
+    where
+        O: KeyValueNode<Key = Self::Key>,
+    {
+        Join {
+            left: self.arrange(),
+            right: other.arrange(),
         }
     }
 
-    pub fn insert(item: T) -> Self {
-        Self { item, weight: true }
-    }
-
-    pub fn remove(item: T) -> Self {
-        Self {
-            item,
-            weight: false,
+    /// Arranges this node by key.
+    fn arrange(self) -> Arrange<Self> {
+        Arrange {
+            node: self,
+            weights: Default::default(),
         }
     }
 
-    pub fn delta(&self) -> i16 {
-        if self.weight { 1 } else { -1 }
-    }
+    /// Consolidates a single update batch into a running total of weight deltas,
+    /// grouped by their keys.
+    fn consolidate_by_key(&mut self) -> OrdMap<Self::Key, OrdMap<Self::Value, i16>>
+    where
+        Self::Item: Clone + Ord + Send + Sync,
+    {
+        // TODO: use explicit im pool allocation?
+        // TODO: make diff type generic (needs "one" value from num crate)
+        let mut total = OrdMap::new();
 
-    pub fn unit_delta_map(self) -> OrdMap<T, i16> {
-        let delta = self.delta();
-        OrdMap::unit(self.item, delta)
+        self.reduce(
+            OrdMap::<Self::Key, OrdMap<Self::Value, _>>::new,
+            |subtotal, update| {
+                let delta = update.delta();
+                let (key, value) = update.item;
+                let weight = subtotal.entry(key).or_default().entry(value).or_default();
+                *weight += delta;
+            },
+            |subtotal| {
+                total = total.clone().union_with(subtotal, |total, subtotal| {
+                    total.union_with(subtotal, |total, subtotal| total + subtotal)
+                });
+            },
+        );
+
+        total
     }
 }
 
-impl<K, V> Update<(K, V)> {
-    pub fn unit_delta_map_keyed(self) -> OrdMap<K, OrdMap<V, i16>> {
-        let delta = self.delta();
-        let (key, value) = self.item;
-        OrdMap::unit(key, OrdMap::unit(value, delta))
-    }
+impl<N, K, V> KeyValueNode for N
+where
+    N: Node<Item = (K, V)>,
+    K: Clone + Ord + Send + Sync + 'static,
+    V: Clone + Ord + Send + Sync,
+{
+    type Key = K;
+    type Value = V;
 }
 
-/// An input event for a dataflow.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Input<T> {
-    /// An item in this dataflow is being updated.
-    Update(Update<T>),
+pub struct Map<N, F> {
+    node: N,
+    cb: F,
+}
 
-    /// This input batch has concluded.
-    Flush,
+impl<N, F, O> Node for Map<N, F>
+where
+    N: Node,
+    F: Fn(N::Item) -> O + Send + Sync,
+    O: Send + Sync,
+{
+    type Item = O;
+
+    fn reduce<T>(
+        &mut self,
+        begin: impl Fn() -> T + Send + Sync,
+        for_each: impl Fn(&mut T, Update<O>) + Send + Sync,
+        finish: impl FnMut(T) + Send + Sync,
+    ) {
+        self.node.reduce(
+            begin,
+            |state, update| for_each(state, update.map(&self.cb)),
+            finish,
+        );
+    }
 }
 
 /// A dataflow node that provides input to a dataflow using an [Input] channel.
@@ -128,29 +399,33 @@ impl<T> Origin<T> {
     }
 }
 
-impl<T: Send + Sync> Node for Origin<T> {
-    type Item = T;
+impl<I: Send + Sync> Node for Origin<I> {
+    type Item = I;
 
-    fn update(&mut self) -> impl ParallelIterator<Item = Update<Self::Item>> + '_ {
-        // create parallel iterator that yields a single batch of updates
-        std::iter::from_fn(|| match self.recv_and_yield() {
-            Input::Update(update) => Some(update),
-            Input::Flush => None,
-        })
-        .par_bridge()
+    fn reduce<T>(
+        &mut self,
+        begin: impl Fn() -> T + Send + Sync,
+        for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
+        mut finish: impl FnMut(T) + Send + Sync,
+    ) {
+        let mut state = begin();
+
+        while let Input::Update(update) = self.recv_and_yield() {
+            for_each(&mut state, update);
+        }
+
+        finish(state);
     }
 }
 
-/// Efficiently produces the union of two values (typically dataflows)
-/// while producing side effects on state `S`.
-///
-/// This makes it possible to run multiple dataflows of the same type
-/// to fixedpoint on disjoint inputs then efficiently unify them.
-pub trait Union<S> {
-    /// Unions this value with another.
-    ///
-    /// Returns `true` if there were any side effects.
-    fn union(&mut self, state: &mut S, other: &Self) -> bool;
+/// An input event for a dataflow.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Input<T> {
+    /// An item in this dataflow is being updated.
+    Update(Update<T>),
+
+    /// This input batch has concluded.
+    Flush,
 }
 
 /// The base trait for dataflow nodes.
@@ -158,262 +433,57 @@ pub trait Node: Sized + Send + Sync {
     /// The type of items collected in this node.
     type Item;
 
-    /// Iterates over a whole batch of updates to this node.
-    fn update(&mut self) -> impl ParallelIterator<Item = Update<Self::Item>> + '_;
+    fn reduce<T>(
+        &mut self,
+        begin: impl Fn() -> T + Send + Sync,
+        for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
+        finish: impl FnMut(T) + Send + Sync,
+    );
 }
 
-/// Convenience methods for nodes.
-pub trait NodeExt: Node {
-    /// Maps the items in this node.
-    fn map<O: Send + Sync>(
-        self,
-        cb: impl Fn(Self::Item) -> O + Send + Sync,
-    ) -> impl Node<Item = O> {
-        Map { node: self, cb }
-    }
+/// A single differential (insert/remove) update for an item.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Update<T> {
+    /// The item.
+    pub item: T,
 
-    /// Consolidates a single update batch into a running total of weight deltas.
-    fn consolidate(&mut self) -> OrdMap<Self::Item, i16>
-    where
-        Self::Item: Clone + Ord + Send + Sync,
-    {
-        // TODO: use explicit im pool allocation?
-        // TODO: make diff type generic (needs "one" value from num crate)
-        self.update()
-            .map(Update::unit_delta_map)
-            .reduce(OrdMap::new, |left, right| {
-                left.union_with(right, |left, right| left + right)
-            })
-    }
+    /// `true` for insertion, `false` for removal.
+    pub weight: bool,
 }
 
-impl<N: Node> NodeExt for N {}
-
-pub struct Map<N, F> {
-    node: N,
-    cb: F,
-}
-
-impl<N, F, O> Node for Map<N, F>
-where
-    N: Node,
-    F: Fn(N::Item) -> O + Send + Sync,
-    O: Send + Sync,
-{
-    type Item = O;
-
-    fn update(&mut self) -> impl ParallelIterator<Item = Update<Self::Item>> + '_ {
-        self.node.update().map(|update| update.map(&self.cb))
-    }
-}
-
-/// A trait for nodes that collect key-value collections.
-pub trait KeyValueNode: Node<Item = (Self::Key, Self::Value)> {
-    /// The key stored in each node value.
-    type Key: Clone + Ord + Send + Sync + 'static;
-
-    /// The value stored in each node value.
-    type Value: Clone + Ord + Send + Sync;
-}
-
-impl<N, K, V> KeyValueNode for N
-where
-    N: Node<Item = (K, V)>,
-    K: Clone + Ord + Send + Sync + 'static,
-    V: Clone + Ord + Send + Sync,
-{
-    type Key = K;
-    type Value = V;
-}
-
-/// Convenience methods for key-value nodes.
-pub trait KeyValueNodeExt: KeyValueNode {
-    /// Joins this node against another key-value node.
-    fn join<O>(self, other: O) -> impl Node<Item = (Self::Key, Self::Value, O::Value)>
-    where
-        O: KeyValueNode<Key = Self::Key>,
-    {
-        Join {
-            left: self.arrange(),
-            right: other.arrange(),
+impl<T> Update<T> {
+    pub fn map<O>(self, cb: impl FnOnce(T) -> O) -> Update<O> {
+        Update {
+            item: cb(self.item),
+            weight: self.weight,
         }
     }
 
-    /// Arranges this node by key.
-    fn arrange(self) -> impl Arranged<Key = Self::Key, Value = Self::Value> {
-        Arrangement {
-            node: self,
-            state: Mutex::new(ArrangedState::new()),
-            weights: Mutex::new(OrdMap::new()),
+    pub fn insert(item: T) -> Self {
+        Self { item, weight: true }
+    }
+
+    pub fn remove(item: T) -> Self {
+        Self {
+            item,
+            weight: false,
         }
     }
 
-    /// Consolidates a single update batch into a running total of weight deltas,
-    /// grouped by their keys.
-    fn consolidate_by_key(&mut self) -> OrdMap<Self::Key, OrdMap<Self::Value, i16>>
-    where
-        Self::Item: Clone + Ord + Send + Sync,
-    {
-        // TODO: use explicit im pool allocation?
-        // TODO: make diff type generic (needs "one" value from num crate)
-        self.update()
-            .map(Update::unit_delta_map_keyed)
-            .reduce(OrdMap::new, |left, right| {
-                left.union_with(right, |left, right| {
-                    left.union_with(right, |left, right| left + right)
-                })
-            })
+    pub fn delta(&self) -> i16 {
+        if self.weight { 1 } else { -1 }
+    }
+
+    pub fn unit_delta_map(self) -> OrdMap<T, i16> {
+        let delta = self.delta();
+        OrdMap::unit(self.item, delta)
     }
 }
 
-impl<N> KeyValueNodeExt for N where N: KeyValueNode {}
-
-/// An arranged collection of key-value relations.
-pub trait Arranged: Send + Sync {
-    /// The key stored in each node value.
-    type Key: Clone + Ord + Send + Sync;
-
-    /// The value stored in each node value.
-    type Value: Clone + Ord + Send + Sync;
-
-    /// Gets the current state of this arrangement.
-    fn state(&self) -> ArrangedState<Self::Key, Self::Value>;
-
-    /// Iterates over the updates in this arrangement while updating state.
-    fn update(&mut self) -> impl ParallelIterator<Item = Update<(Self::Key, Self::Value)>> + '_;
-}
-
-pub type ArrangedState<K, V> = OrdMap<K, OrdSet<V>>;
-
-/// An arrangement: a reduced collection of key-value relations.
-pub struct Arrangement<N, K, V> {
-    node: N,
-    state: Mutex<ArrangedState<K, V>>,
-    weights: Mutex<OrdMap<K, OrdMap<V, i16>>>,
-}
-
-impl<N, K, V> Arranged for Arrangement<N, K, V>
-where
-    N: KeyValueNode<Key = K, Value = V>,
-    K: Ord + Clone + Send + Sync,
-    V: Ord + Clone + Send + Sync,
-{
-    type Key = K;
-    type Value = V;
-
-    fn state(&self) -> ArrangedState<K, V> {
-        self.state.lock().clone()
+impl<K, V> Update<(K, V)> {
+    pub fn unit_delta_map_keyed(self) -> OrdMap<K, OrdMap<V, i16>> {
+        let delta = self.delta();
+        let (key, value) = self.item;
+        OrdMap::unit(key, OrdMap::unit(value, delta))
     }
-
-    fn update(&mut self) -> impl ParallelIterator<Item = Update<(K, V)>> {
-        self.node
-            .consolidate_by_key()
-            .into_iter()
-            .par_bridge()
-            .flat_map_iter(move |(key, values)| {
-                // clone current state and running weights
-                let mut weights = self.weights.lock().get(&key).cloned().unwrap_or_default();
-                let mut state = self.state.lock().get(&key).cloned().unwrap_or_default();
-
-                // apply weight deltas while collecting state diffs
-                let mut diff = Vec::with_capacity(values.len());
-                for (value, delta) in values {
-                    weights = weights.alter(
-                        |entry| {
-                            let old_value = entry.unwrap_or(0);
-                            let new_value = old_value + delta;
-
-                            if new_value > 0 && old_value <= 0 {
-                                state.insert(value.clone());
-                                diff.push(Update::insert((key.clone(), value.clone())));
-                            } else if new_value <= 0 && old_value > 0 {
-                                state.remove(&value);
-                                diff.push(Update::remove((key.clone(), value.clone())));
-                            }
-
-                            if new_value == 0 {
-                                None
-                            } else {
-                                Some(new_value)
-                            }
-                        },
-                        value.clone(),
-                    );
-                }
-
-                // update running weights
-                self.weights.lock().insert(key.clone(), weights);
-
-                // update running state
-                self.state.lock().insert(key, state);
-
-                // return update diff
-                diff
-            })
-    }
-}
-
-/// A symmetric equijoin dataflow node.
-pub struct Join<L, R> {
-    left: L,
-    right: R,
-}
-
-impl<K, L, R> Node for Join<L, R>
-where
-    K: Clone + Ord + Send + Sync + 'static,
-    L: Arranged<Key = K>,
-    R: Arranged<Key = K>,
-{
-    type Item = (K, L::Value, R::Value);
-
-    fn update(&mut self) -> impl ParallelIterator<Item = Update<Self::Item>> + '_ {
-        // update left branch and preserve updates
-        let left_updates = self.left.update().collect_vec_list();
-
-        // join old right state against batched left updates
-        // TODO: would manual rayon consumers be more efficient than collecting updates? BENCH FIRST
-        let right_half = half_join(
-            self.right.state(),
-            left_updates.into_iter().par_bridge().flatten(),
-        );
-
-        // join right updates against up-to-date left state
-        let left_half = half_join(self.left.state(), self.right.update());
-
-        // combine halves
-        right_half
-            .map(|update| update.map(|(key, right, left)| (key, left, right)))
-            .chain(left_half)
-    }
-}
-
-// TODO: rename to inner join? split join?
-pub(crate) fn half_join<'a, K, VL, VR>(
-    state: ArrangedState<K, VL>,
-    updates: impl ParallelIterator<Item = Update<(K, VR)>> + 'a,
-) -> impl ParallelIterator<Item = Update<(K, VL, VR)>> + 'a
-where
-    K: Clone + Ord + Send + Sync + 'a,
-    VL: Clone + Ord + Send + Sync + 'a,
-    VR: Clone + Send + Sync + 'a,
-{
-    updates
-        .flat_map_iter(move |item| {
-            let Update {
-                item: (key, outer),
-                weight,
-            } = item;
-
-            state
-                .get(&key)
-                .cloned()
-                .map(|inner| (key, weight, inner, outer))
-        })
-        .flat_map_iter(move |(key, weight, inner, outer)| {
-            inner.into_iter().map(move |inner| Update {
-                weight,
-                item: (key.clone(), inner.to_owned(), outer.clone()),
-            })
-        })
 }
