@@ -25,7 +25,35 @@ pub trait NodeExt: Node {
         self,
         cb: impl Fn(Self::Item) -> O + Send + Sync,
     ) -> impl Node<Item = O> {
+        self.flat_map(move |item| Some(cb(item)))
+    }
+
+    /// Only permits items that pass a test to continue.
+    fn filter(
+        self,
+        test: impl Fn(&Self::Item) -> bool + Send + Sync,
+    ) -> impl Node<Item = Self::Item>
+    where
+        Self::Item: Send + Sync,
+    {
+        self.flat_map(move |item| if test(&item) { Some(item) } else { None })
+    }
+
+    /// Flat-maps each item in this node to an iterator of a new item type.
+    fn flat_map<O>(self, cb: impl Fn(Self::Item) -> O + Send + Sync) -> impl Node<Item = O::Item>
+    where
+        O: IntoIterator + Send + Sync,
+        O::Item: Send + Sync,
+    {
         Map { node: self, cb }
+    }
+
+    /// Flattens a node of iterators into a node of those iterated values.
+    fn flatten(self) -> impl Node<Item = <<Self as Node>::Item as IntoIterator>::Item>
+    where
+        Self::Item: IntoIterator<Item: Send + Sync> + Send + Sync,
+    {
+        self.flat_map(std::convert::identity)
     }
 
     /// Consolidates a single update batch into a running total of weight deltas.
@@ -316,19 +344,30 @@ impl<N, F, O> Node for Map<N, F>
 where
     N: Node,
     F: Fn(N::Item) -> O + Send + Sync,
-    O: Send + Sync,
+    O: IntoIterator,
+    O::Item: Send + Sync,
 {
-    type Item = O;
+    type Item = O::Item;
 
     fn update<T>(
         &mut self,
         begin: impl Fn() -> T + Send + Sync,
-        for_each: impl Fn(&mut T, Update<O>) + Send + Sync,
+        for_each: impl Fn(&mut T, Update<O::Item>) + Send + Sync,
         finish: impl FnMut(T) + Send + Sync,
     ) {
         self.node.update(
             begin,
-            |state, update| for_each(state, update.map(&self.cb)),
+            |state, update| {
+                (self.cb)(update.item).into_iter().for_each(|item| {
+                    for_each(
+                        state,
+                        Update {
+                            item,
+                            weight: update.weight,
+                        },
+                    )
+                })
+            },
             finish,
         );
     }
