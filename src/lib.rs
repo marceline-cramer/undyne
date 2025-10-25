@@ -37,7 +37,7 @@ pub trait NodeExt: Node {
         // TODO: make diff type generic (needs "one" value from num crate)
         let mut total = OrdMap::new();
 
-        self.reduce(
+        self.update(
             OrdMap::new,
             |subtotal, update| {
                 let delta = update.delta();
@@ -70,7 +70,7 @@ where
 {
     type Item = (L::Key, L::Value, R::Value);
 
-    fn reduce<T>(
+    fn update<T>(
         &mut self,
         begin: impl Fn() -> T + Send + Sync,
         for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
@@ -99,8 +99,8 @@ where
         // copy current weights to observe updates in parallel
         let weights = self.weights.clone();
 
-        // reduce right branch
-        right.reduce_by_key(
+        // update right branch against current left state
+        right.update_by_key(
             |key| {
                 (
                     key.clone(),
@@ -126,8 +126,8 @@ where
         // copy right weights to observe updates in parallel
         let weights = right.weights.clone();
 
-        // reduce left branch
-        self.reduce_by_key(
+        // update left branch against new right state
+        self.update_by_key(
             |key| {
                 (
                     key.clone(),
@@ -151,7 +151,7 @@ where
         );
     }
 
-    pub fn reduce_by_key<T>(
+    pub fn update_by_key<T>(
         &mut self,
         begin: impl Fn(&N::Key) -> T + Send + Sync,
         for_each: impl Fn(&mut T, Update<N::Value>) + Send + Sync,
@@ -278,7 +278,7 @@ pub trait KeyValueNode: Node<Item = (Self::Key, Self::Value)> {
         // TODO: make diff type generic (needs "one" value from num crate)
         let mut total = OrdMap::new();
 
-        self.reduce(
+        self.update(
             OrdMap::<Self::Key, OrdMap<Self::Value, _>>::new,
             |subtotal, update| {
                 let delta = update.delta();
@@ -320,13 +320,13 @@ where
 {
     type Item = O;
 
-    fn reduce<T>(
+    fn update<T>(
         &mut self,
         begin: impl Fn() -> T + Send + Sync,
         for_each: impl Fn(&mut T, Update<O>) + Send + Sync,
         finish: impl FnMut(T) + Send + Sync,
     ) {
-        self.node.reduce(
+        self.node.update(
             begin,
             |state, update| for_each(state, update.map(&self.cb)),
             finish,
@@ -417,7 +417,7 @@ impl<T> Origin<T> {
 impl<I: Send + Sync> Node for Origin<I> {
     type Item = I;
 
-    fn reduce<T>(
+    fn update<T>(
         &mut self,
         begin: impl Fn() -> T + Send + Sync,
         for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
@@ -448,7 +448,7 @@ pub trait Node: Sized + Send + Sync {
     /// The type of items collected in this node.
     type Item;
 
-    fn reduce<T>(
+    fn update<T>(
         &mut self,
         begin: impl Fn() -> T + Send + Sync,
         for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
