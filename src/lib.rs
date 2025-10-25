@@ -81,6 +81,14 @@ pub trait NodeExt: Node {
 
         total
     }
+
+    /// Concatenates updates with this node with the updates from another node.
+    fn concat(self, other: impl Node<Item = Self::Item>) -> impl Node<Item = Self::Item> {
+        Concat {
+            left: self,
+            right: other,
+        }
+    }
 }
 
 impl<N: Node> NodeExt for N {}
@@ -505,6 +513,39 @@ pub enum Input<T> {
 
     /// This input batch has concluded.
     Flush,
+}
+
+/// Concatenates two dataflow nodes together.
+pub struct Concat<L, R> {
+    left: L,
+    right: R,
+}
+
+impl<L, R> Node for Concat<L, R>
+where
+    L: Node,
+    R: Node<Item = L::Item>,
+{
+    type Item = L::Item;
+
+    fn update<T>(
+        &mut self,
+        begin: impl Fn() -> T + Send + Sync,
+        for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
+        mut finish: impl FnMut(T) + Send + Sync,
+    ) {
+        // move finish closure into mutex to call concurrently
+        let finish = Mutex::new(&mut finish);
+
+        // convert finish closure into immutable closure
+        let finish = move |state| (finish.lock())(state);
+
+        // run each inner node branch simultaneously
+        rayon::join(
+            || self.left.update(&begin, &for_each, &finish),
+            || self.right.update(&begin, &for_each, &finish),
+        );
+    }
 }
 
 /// The base trait for dataflow nodes.
