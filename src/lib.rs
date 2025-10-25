@@ -86,25 +86,38 @@ pub trait NodeExt: Node {
 impl<N: Node> NodeExt for N {}
 
 /// A symmetric equijoin dataflow node.
-pub struct Join<L: KeyValueNode, R: KeyValueNode> {
+pub struct Join<L: KeyValueNode, R: KeyValueNode, F> {
     left: Arrange<L>,
     right: Arrange<R>,
+    cb: F,
 }
 
-impl<L, R> Node for Join<L, R>
+impl<L, R, F, O> Node for Join<L, R, F>
 where
     L: KeyValueNode,
     R: KeyValueNode<Key = L::Key>,
+    F: Fn(&L::Key, &L::Value, &R::Value) -> O + Send + Sync,
+    O: Send + Sync,
 {
-    type Item = (L::Key, L::Value, R::Value);
+    type Item = O;
 
     fn update<T>(
         &mut self,
         begin: impl Fn() -> T + Send + Sync,
-        for_each: impl Fn(&mut T, Update<Self::Item>) + Send + Sync,
+        for_each: impl Fn(&mut T, Update<O>) + Send + Sync,
         finish: impl FnMut(T) + Send + Sync,
     ) {
-        self.left.join(&mut self.right, begin, for_each, finish);
+        self.left.join(
+            &mut self.right,
+            begin,
+            |state, update| {
+                for_each(
+                    state,
+                    update.map(|(key, left, right)| (self.cb)(key, left, right)),
+                )
+            },
+            finish,
+        );
     }
 }
 
@@ -121,7 +134,7 @@ where
         &mut self,
         right: &mut Arrange<R>,
         begin: impl Fn() -> T + Send + Sync,
-        for_each: impl Fn(&mut T, Update<(N::Key, N::Value, R::Value)>) + Send + Sync,
+        for_each: impl Fn(&mut T, Update<(&N::Key, &N::Value, &R::Value)>) + Send + Sync,
         mut finish: impl FnMut(T) + Send + Sync,
     ) {
         // copy current weights to observe updates in parallel
@@ -139,10 +152,8 @@ where
             |(key, left, state), update| {
                 // TODO: figure out the weight diff logic (write unit tests)
                 for (left, weight) in left.iter() {
-                    let key = key.clone();
-                    let left = left.clone();
                     let weight = *weight > 0;
-                    let update = update.clone().map(|right| (key, left, right));
+                    let update = update.as_ref().map(|right| (&*key, left, right));
                     for_each(state, update);
                 }
             },
@@ -166,10 +177,8 @@ where
             |(key, right, state), update| {
                 // TODO: figure out the weight diff logic (write unit tests)
                 for (right, weight) in right.iter() {
-                    let key = key.clone();
-                    let right = right.clone();
                     let weight = *weight > 0;
-                    let update = update.clone().map(|left| (key, left, right));
+                    let update = update.as_ref().map(|left| (&*key, left, right));
                     for_each(state, update);
                 }
             },
@@ -278,13 +287,29 @@ pub trait KeyValueNode: Node<Item = (Self::Key, Self::Value)> {
     type Value: Clone + Ord + Send + Sync;
 
     /// Joins this node against another key-value node.
-    fn join<O>(self, other: O) -> impl Node<Item = (Self::Key, Self::Value, O::Value)>
+    fn join<R>(self, other: R) -> impl Node<Item = (Self::Key, Self::Value, R::Value)>
     where
-        O: KeyValueNode<Key = Self::Key>,
+        R: KeyValueNode<Key = Self::Key>,
+    {
+        self.join_map(other, |key, left, right| {
+            (key.clone(), left.clone(), right.clone())
+        })
+    }
+
+    /// Joins this node against another key-value node, using a mapping function to handle each pairing.
+    fn join_map<R, O>(
+        self,
+        other: R,
+        cb: impl Fn(&Self::Key, &Self::Value, &R::Value) -> O + Send + Sync,
+    ) -> impl Node<Item = O>
+    where
+        R: KeyValueNode<Key = Self::Key>,
+        O: Send + Sync,
     {
         Join {
             left: self.arrange(),
             right: other.arrange(),
+            cb,
         }
     }
 
@@ -531,6 +556,13 @@ impl<T> Update<T> {
     pub fn unit_delta_map(self) -> OrdMap<T, i16> {
         let delta = self.delta();
         OrdMap::unit(self.item, delta)
+    }
+
+    pub fn as_ref(&self) -> Update<&T> {
+        Update {
+            item: &self.item,
+            weight: self.weight,
+        }
     }
 }
 
