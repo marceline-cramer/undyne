@@ -318,8 +318,3 @@ impl<T, N: Node<T>> Node<T> for &N {
 pub trait Data: Clone + Send + Sync {}
 
 impl<T: Clone + Send + Sync> Data for T {}
-
-pub enum MaybeOwned<'a, T: 'a> {
-    Borrowed(&'a T),
-    Owned(T),
-}
