@@ -55,3 +55,21 @@ fn test_join() {
     let node = input.join(input);
     expect_result(node, [(0, 1), (1, 2)], [(0, 1, 2)]);
 }
+
+#[test]
+fn transitive_closure() {
+    let input = Input::<(usize, usize)>::new();
+
+    let node = input.fixedpoint(|edges| {
+        edges
+            .map(|(a, b)| (*b, *a))
+            .join(edges)
+            .map(|(_b, c, a)| (*a, *c))
+    });
+
+    expect_result(
+        node,
+        [(0, 1), (1, 2), (2, 3)],
+        [(0, 1), (1, 2), (2, 3), (0, 2), (1, 3), (0, 3)],
+    );
+}
