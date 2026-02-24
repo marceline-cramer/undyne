@@ -53,7 +53,11 @@ fn test_fixedpoint_range() {
 fn test_join() {
     let input = Input::<(usize, usize)>::new();
     let node = input.join(input);
-    expect_result(node, [(0, 1), (1, 2)], [(0, 1, 2)]);
+    expect_result(
+        node,
+        [(0, 1), (0, 2)],
+        [(0, 1, 1), (0, 1, 2), (0, 2, 1), (0, 2, 2)],
+    );
 }
 
 #[test]
@@ -64,7 +68,8 @@ fn transitive_closure() {
         edges
             .map(|(a, b)| (*b, *a))
             .join(edges)
-            .map(|(_b, c, a)| (*a, *c))
+            .filter(|(_b, a, c)| *a < *c)
+            .map(|(_b, a, c)| (*a, *c))
     });
 
     expect_result(
