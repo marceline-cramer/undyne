@@ -80,27 +80,6 @@ pub trait NodeExt<T: Copy + Send + Sync>: Node<T> {
 
 impl<T: Copy + Data, N: Node<T>> NodeExt<T> for N {}
 
-pub struct FanOut<N>(N);
-
-impl<N> Clone for FanOut<N> {
-    fn clone(&self) -> Self {
-        todo!()
-    }
-}
-
-impl<T, N: Node<T>> Node<T> for FanOut<N> {
-    type Input = N::Input;
-    type Output = N::Output;
-
-    fn update(
-        &self,
-        input: &(Self::Input, T, isize),
-        output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
-    ) {
-        todo!()
-    }
-}
-
 pub struct Input<D, T = usize> {
     _data: PhantomData<D>,
     _time: PhantomData<T>,
@@ -312,6 +291,7 @@ impl<T, N: Node<T>> Node<T> for &N {
         input: &(Self::Input, T, isize),
         output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
     ) {
+        (*self).update(input, output)
     }
 }
 
