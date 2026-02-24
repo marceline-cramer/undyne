@@ -6,23 +6,46 @@ use parking_lot::Mutex;
 mod tests;
 
 pub trait KeyValueNodeExt<T: Copy + Data>: KeyValueNode<T> {
-    fn join<R>(
+    fn join<R: Data>(
         self,
         rhs: impl KeyValueNode<T, Input = Self::Input, Key = Self::Key, Value = R>,
     ) -> impl NodeExt<T, Input = Self::Input, Output = (Self::Key, Self::Value, R)> {
-        todo!()
+        Join(self, rhs)
     }
 }
 
 impl<T: Copy + Data, N: KeyValueNode<T>> KeyValueNodeExt<T> for N {}
 
+pub struct Join<L, R>(L, R);
+
+impl<T, K, I, L, R> Node<T> for Join<L, R>
+where
+    I: Data,
+    K: Data,
+    L: KeyValueNode<T, Key = K, Input = I>,
+    R: KeyValueNode<T, Key = K, Input = I>,
+{
+    type Input = I;
+    type Output = (K, L::Value, R::Value);
+
+    fn update(
+        &self,
+        input: &(Self::Input, T, isize),
+        output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
+    ) {
+        todo!();
+    }
+}
+
 pub trait KeyValueNode<T>: Node<T, Output = (Self::Key, Self::Value)> {
-    type Key;
-    type Value;
+    type Key: Data;
+    type Value: Data;
 }
 
 impl<T, K, V, N> KeyValueNode<T> for N
 where
+    K: Data,
+    V: Data,
     N: Node<T, Output = (K, V)>,
 {
     type Key = K;
