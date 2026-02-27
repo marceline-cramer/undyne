@@ -167,14 +167,17 @@ pub trait NodeExt<T: Time>: Node<T> {
         Chain(self, FlatMap(op, PhantomData, PhantomData))
     }
 
-    fn concat(
+    fn fork<O, L, R>(
         self,
-        other: impl NodeExt<T, Input = Self::Input, Output = Self::Output>,
-    ) -> impl NodeExt<T, Input = Self::Input, Output = Self::Output>
+        scope: impl FnOnce(Input<Self::Output>, Input<Self::Output>) -> (L, R),
+    ) -> impl NodeExt<T, Input = Self::Input>
     where
-        Self::Input: Clone,
+        O: Data,
+        L: Node<T, Input = Self::Output, Output = O>,
+        R: Node<T, Input = Self::Output, Output = O>,
     {
-        Concat(self, other)
+        let (left, right) = scope(Input::new_internal(), Input::new_internal());
+        Chain(self, Fork(left, right))
     }
 
     fn fixedpoint<N>(
@@ -228,16 +231,22 @@ impl<T: Time, D: Data> Node<T> for Input<D, T> {
 
 impl<D> Default for Input<D, usize> {
     fn default() -> Self {
-        Self {
-            _data: PhantomData,
-            _time: PhantomData,
-        }
+        Self::new_internal()
     }
 }
 
 impl<D> Input<D, usize> {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+impl<D, T> Input<D, T> {
+    pub(crate) fn new_internal() -> Self {
+        Self {
+            _data: PhantomData,
+            _time: PhantomData,
+        }
     }
 }
 
@@ -344,9 +353,9 @@ where
     }
 }
 
-pub struct Concat<L, R>(L, R);
+pub struct Fork<L, R>(L, R);
 
-impl<I, O, T, L, R> Node<T> for Concat<L, R>
+impl<I, O, T, L, R> Node<T> for Fork<L, R>
 where
     I: Data,
     O: Data,
@@ -398,19 +407,6 @@ pub trait Node<T: Time>: Send + Sync + Sized {
         input: &(Self::Input, T, isize),
         output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
     );
-}
-
-impl<T: Time, N: Node<T>> Node<T> for &N {
-    type Input = N::Input;
-    type Output = N::Output;
-
-    fn update(
-        &self,
-        input: &(Self::Input, T, isize),
-        output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
-    ) {
-        (*self).update(input, output)
-    }
 }
 
 pub trait Time: Data + PartialOrd {}
