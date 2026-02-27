@@ -1,114 +1,75 @@
-use std::{collections::BTreeMap, fmt::Debug, marker::PhantomData};
+use std::{collections::BTreeMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use parking_lot::Mutex;
 
 #[cfg(test)]
 mod tests;
 
-pub trait KeyValueNodeExt<T: Time>: KeyValueNode<T, Key: Ord, Value: Ord> {
-    fn join<R: Ord + Data>(
+pub trait PrefixNodeExt<T: Time>: Node<T, Output = (Self::Key, Self::Value)> {
+    type Key: Data + Ord;
+    type Value: Data;
+
+    fn prefix<N>(
         self,
-        rhs: impl KeyValueNode<T, Input = Self::Input, Key = Self::Key, Value = R>,
-    ) -> impl NodeExt<T, Input = Self::Input, Output = (Self::Key, Self::Value, R)> {
-        Join(
-            NaiveArrangement::<T, _>::new(self),
-            NaiveArrangement::<T, _>::new(rhs),
+        factory: impl Fn(Self::Key, Input<Self::Value, T>) -> N + Send + Sync,
+    ) -> impl NodeExt<T, Input = Self::Input, Output = N::Output>
+    where
+        N: Node<T, Input = Self::Value>,
+    {
+        Chain(
+            self,
+            Prefix {
+                factory: move |key| factory(key, Input::new_internal()),
+                keys: Mutex::new(BTreeMap::new()),
+            },
         )
     }
+
+    fn join<N>(
+        self,
+        rhs: N,
+    ) -> impl NodeExt<T, Input = Self::Input, Output = (Self::Key, Self::Value, N::Value)>
+    where
+        Self::Value: Ord,
+        N: PrefixNodeExt<T, Input = Self::Input, Key = Self::Key, Value: Ord>,
+    {
+        let left = self.map(|(key, value)| (key.clone(), Either::Left(value.clone())));
+        let right = rhs.map(|(key, value)| (key.clone(), Either::Right(value.clone())));
+        let either = Fork(left, right);
+
+        either.prefix(|key, scope| {
+            let left = NaiveArrangement::<T, Self::Value>::default();
+            let right = NaiveArrangement::<T, N::Value>::default();
+            let product = Product::new(left, right);
+            Chain(scope, product).map(move |(l, r)| (key.clone(), l.clone(), r.clone()))
+        })
+    }
 }
 
-impl<T: PartialOrd + Data, N: KeyValueNode<T, Key: Ord, Value: Ord>> KeyValueNodeExt<T> for N {}
-
-pub struct Join<L, R>(L, R);
-
-impl<T, K, I, L, R> Node<T> for Join<L, R>
+impl<T, N, K, V> PrefixNodeExt<T> for N
 where
-    I: Data,
-    K: Data,
-    L: Send + Sync,
-    R: Send + Sync,
     T: Time,
-    L: Arranged<T, Key = K, Input = I>,
-    R: Arranged<T, Key = K, Input = I>,
+    K: Ord + Data,
+    V: Data,
+    N: Node<T, Output = (K, V)>,
 {
-    type Input = I;
-    type Output = (K, L::Value, R::Value);
-
-    fn update(
-        &self,
-        input: &(Self::Input, T, isize),
-        output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
-    ) {
-        self.0.update(input, |((key, lhs), time, ldiff)| {
-            self.1.aggregate(time, key, |sums| {
-                for (rhs, rdiff) in sums {
-                    let value = (key.clone(), lhs.clone(), rhs.clone());
-                    output(&(value, time.clone(), ldiff * rdiff));
-                }
-            });
-        });
-
-        self.1.update(input, |((key, rhs), time, rdiff)| {
-            self.0.aggregate(time, key, |sums| {
-                for (lhs, ldiff) in sums {
-                    let value = (key.clone(), lhs.clone(), rhs.clone());
-                    output(&(value, time.clone(), ldiff * rdiff));
-                }
-            });
-        });
-    }
+    type Key = K;
+    type Value = V;
 }
 
-pub struct NaiveArrangement<T: Time, N: KeyValueNode<T>> {
-    node: N,
-    history: Mutex<Vec<(T, N::Key, N::Value, isize)>>,
+pub struct Prefix<F, K, N> {
+    factory: F,
+    keys: Mutex<BTreeMap<K, Arc<N>>>,
 }
 
-impl<T: Time, N: KeyValueNode<T>> NaiveArrangement<T, N> {
-    pub fn new(node: N) -> Self {
-        Self {
-            node,
-            history: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl<N, T> Arranged<T> for NaiveArrangement<T, N>
+impl<T, F, K, N> Node<T> for Prefix<F, K, N>
 where
-    N: KeyValueNode<T, Key: Eq, Value: Ord>,
-    T: PartialOrd + Data,
-{
-    fn aggregate(&self, time: &T, key: &Self::Key, output: impl Fn(&[(Self::Value, isize)])) {
-        let mut sums = BTreeMap::new();
-        for (prev_time, prev_key, value, diff) in self.history.lock().iter() {
-            if prev_key != key {
-                continue;
-            }
-
-            if !prev_time.less_equal(time) {
-                continue;
-            }
-
-            *sums.entry(value.clone()).or_default() += diff;
-        }
-
-        eprintln!("{key:?}@{time:?}: {sums:?}");
-
-        if sums.is_empty() {
-            return;
-        }
-
-        let as_vec: Vec<_> = sums.into_iter().collect();
-        output(as_vec.as_slice());
-    }
-}
-
-impl<N, T> Node<T> for NaiveArrangement<T, N>
-where
-    N: KeyValueNode<T>,
     T: Time,
+    F: Fn(K) -> N + Send + Sync,
+    K: Data + Ord,
+    N: Node<T>,
 {
-    type Input = N::Input;
+    type Input = (K, N::Input);
     type Output = N::Output;
 
     fn update(
@@ -116,33 +77,122 @@ where
         input: &(Self::Input, T, isize),
         output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
     ) {
-        self.node.update(input, |update| {
-            let ((key, value), time, diff) = update;
-            let history = (time.clone(), key.clone(), value.clone(), *diff);
-            output(update);
-            self.history.lock().push(history);
-        });
+        let ((key, value), time, diff) = input;
+
+        let node = self
+            .keys
+            .lock()
+            .entry(key.to_owned())
+            .or_insert_with(|| Arc::new((self.factory)(key.to_owned())))
+            .to_owned();
+
+        let update = (value.clone(), time.clone(), *diff);
+        node.update(&update, &output);
     }
 }
 
-pub trait Arranged<T: Time>: KeyValueNode<T, Key: Eq> {
-    fn aggregate(&self, time: &T, key: &Self::Key, output: impl Fn(&[(Self::Value, isize)]));
+pub struct Product<L, R>(Arc<Mutex<(L, R)>>);
+
+impl<L, R> Clone for Product<L, R> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
 }
 
-pub trait KeyValueNode<T: Time>: Node<T, Output = (Self::Key, Self::Value)> {
-    type Key: Data;
-    type Value: Data;
+impl<L, R> Product<L, R> {
+    pub(crate) fn new(left: L, right: R) -> Self {
+        Self(Arc::new(Mutex::new((left, right))))
+    }
 }
 
-impl<T, K, V, N> KeyValueNode<T> for N
+impl<T, L, R> Node<T> for Product<L, R>
 where
     T: Time,
-    K: Data,
-    V: Data,
-    N: Node<T, Output = (K, V)>,
+    L: Arranged<T>,
+    R: Arranged<T>,
 {
-    type Key = K;
-    type Value = V;
+    type Input = Either<L::Data, R::Data>;
+    type Output = (L::Data, R::Data);
+
+    fn update(
+        &self,
+        input: &(Self::Input, T, isize),
+        output: impl Fn(&(Self::Output, T, isize)) + Send + Sync,
+    ) {
+        // lock both halfs to serialize symmetric entries
+        let mut guard = self.0.lock();
+
+        let (data, time, inner_diff) = input;
+        match data.clone() {
+            Either::Left(data) => {
+                guard.0.update(&(data.clone(), time.clone(), *inner_diff));
+
+                guard.1.query(time, |outer_data, outer_diff| {
+                    let diff = inner_diff * outer_diff;
+                    output(&((data.clone(), outer_data.clone()), time.clone(), diff));
+                });
+            }
+            Either::Right(data) => {
+                guard.1.update(&(data.clone(), time.clone(), *inner_diff));
+
+                guard.0.query(time, |outer_data, outer_diff| {
+                    let diff = inner_diff * outer_diff;
+                    output(&((outer_data.clone(), data.clone()), time.clone(), diff));
+                });
+            }
+        }
+    }
+}
+
+pub struct NaiveArrangement<T, D> {
+    history: Vec<(T, D, isize)>,
+}
+
+impl<T, D> Default for NaiveArrangement<T, D> {
+    fn default() -> Self {
+        Self {
+            history: Vec::new(),
+        }
+    }
+}
+
+impl<T, D> Arranged<T> for NaiveArrangement<T, D>
+where
+    T: Time,
+    D: Ord + Data,
+{
+    type Data = D;
+
+    fn update(&mut self, input: &(D, T, isize)) {
+        let (data, time, diff) = input;
+        let update = (time.clone(), data.clone(), *diff);
+        self.history.push(update);
+    }
+
+    fn query(&self, time: &T, mut output: impl FnMut(&Self::Data, isize)) {
+        let mut sums = BTreeMap::new();
+        for (prev_time, data, diff) in self.history.iter() {
+            if !prev_time.less_equal(time) {
+                continue;
+            }
+
+            *sums.entry(data).or_default() += diff;
+        }
+
+        eprintln!("{time:?}: {sums:?}");
+
+        for (data, diff) in sums {
+            output(data, diff);
+        }
+    }
+}
+
+pub trait Arranged<T: Time>: Send + Sync {
+    type Data: Ord + Data;
+
+    fn update(&mut self, input: &(Self::Data, T, isize));
+
+    fn query(&self, time: &T, output: impl Fn(&Self::Data, isize));
 }
 
 pub trait NodeExt<T: Time>: Node<T> {
@@ -178,6 +228,32 @@ pub trait NodeExt<T: Time>: Node<T> {
     {
         let (left, right) = scope(Input::new_internal(), Input::new_internal());
         Chain(self, Fork(left, right))
+    }
+
+    fn either<N>(
+        self,
+        rhs: N,
+    ) -> impl NodeExt<T, Input = Self::Input, Output = Either<Self::Output, N::Output>>
+    where
+        N: Node<T, Input = Self::Input>,
+    {
+        let left = self.map(|data| Either::Left(data.clone()));
+        let right = rhs.map(|data| Either::Right(data.clone()));
+        Fork(left, right)
+    }
+
+    fn product<N>(
+        self,
+        rhs: N,
+    ) -> impl NodeExt<T, Input = Self::Input, Output = (Self::Output, N::Output)>
+    where
+        Self::Output: Ord,
+        N: Node<T, Input = Self::Input, Output: Ord>,
+    {
+        let left = NaiveArrangement::<T, Self::Output>::default();
+        let right = NaiveArrangement::<T, N::Output>::default();
+        let product = Product::new(left, right);
+        Chain(self.either(rhs), product)
     }
 
     fn fixedpoint<N>(
@@ -456,4 +532,10 @@ impl<L: PartialOrd, R: PartialOrd> PartialOrd for (L, R) {
     fn less_equal(&self, other: &Self) -> bool {
         self.0.less_equal(&other.0) && self.1.less_equal(&other.1)
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum Either<L, R> {
+    Left(L),
+    Right(R),
 }
